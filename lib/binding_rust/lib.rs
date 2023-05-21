@@ -12,8 +12,7 @@ use std::{
     mem::MaybeUninit,
     ops,
     os::raw::{c_char, c_void},
-    ptr::{self, NonNull},
-    slice, str,
+    ptr, slice, str,
     sync::atomic::AtomicUsize,
     u16,
 };
@@ -44,7 +43,7 @@ pub struct Language(*const ffi::TSLanguage);
 
 /// A tree that represents the syntactic structure of a source code file.
 #[doc(alias = "TSTree")]
-pub struct Tree(NonNull<ffi::TSTree>);
+pub struct Tree<'a>(*mut ffi::TSTree, PhantomData<&'a ()>);
 
 /// A position in a multi-line text document, in terms of rows and columns.
 ///
@@ -84,7 +83,7 @@ pub struct Node<'a>(ffi::TSNode, PhantomData<&'a ()>);
 
 /// A stateful object that this is used to produce a `Tree` based on some source code.
 #[doc(alias = "TSParser")]
-pub struct Parser(NonNull<ffi::TSParser>);
+pub struct Parser<'a>(*mut ffi::TSParser, PhantomData<&'a ()>);
 
 /// A type of log message.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,7 +103,7 @@ pub struct TreeCursor<'a>(ffi::TSTreeCursor, PhantomData<&'a ()>);
 #[doc(alias = "TSQuery")]
 #[derive(Debug)]
 pub struct Query {
-    ptr: NonNull<ffi::TSQuery>,
+    ptr: *mut ffi::TSQuery,
     capture_names: Vec<String>,
     capture_quantifiers: Vec<Vec<CaptureQuantifier>>,
     text_predicates: Vec<Box<[TextPredicate]>>,
@@ -139,7 +138,7 @@ impl From<ffi::TSQuantifier> for CaptureQuantifier {
 /// A stateful object for executing a `Query` on a syntax `Tree`.
 #[doc(alias = "TSQueryCursor")]
 pub struct QueryCursor {
-    ptr: NonNull<ffi::TSQueryCursor>,
+    ptr: *mut ffi::TSQueryCursor,
 }
 
 /// A key-value pair associated with a particular pattern in a `Query`.
@@ -336,12 +335,12 @@ impl Language {
     }
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// Create a new parser.
-    pub fn new() -> Parser {
+    pub fn new() -> Parser<'a> {
         unsafe {
             let parser = ffi::ts_parser_new();
-            Parser(NonNull::new_unchecked(parser))
+            Parser(parser, PhantomData)
         }
     }
 
@@ -360,7 +359,7 @@ impl Parser {
             Err(LanguageError { version })
         } else {
             unsafe {
-                ffi::ts_parser_set_language(self.0.as_ptr(), language.0);
+                ffi::ts_parser_set_language(self.0, language.0);
             }
             Ok(())
         }
@@ -369,7 +368,7 @@ impl Parser {
     /// Get the parser's current language.
     #[doc(alias = "ts_parser_language")]
     pub fn language(&self) -> Option<Language> {
-        let ptr = unsafe { ffi::ts_parser_language(self.0.as_ptr()) };
+        let ptr = unsafe { ffi::ts_parser_language(self.0) };
         if ptr.is_null() {
             None
         } else {
@@ -380,14 +379,14 @@ impl Parser {
     /// Get the parser's current logger.
     #[doc(alias = "ts_parser_logger")]
     pub fn logger(&self) -> Option<&Logger> {
-        let logger = unsafe { ffi::ts_parser_logger(self.0.as_ptr()) };
+        let logger = unsafe { ffi::ts_parser_logger(self.0) };
         unsafe { (logger.payload as *mut Logger).as_ref() }
     }
 
     /// Set the logging callback that a parser should use during parsing.
     #[doc(alias = "ts_parser_set_logger")]
     pub fn set_logger(&mut self, logger: Option<Logger>) {
-        let prev_logger = unsafe { ffi::ts_parser_logger(self.0.as_ptr()) };
+        let prev_logger = unsafe { ffi::ts_parser_logger(self.0) };
         if !prev_logger.payload.is_null() {
             drop(unsafe { Box::from_raw(prev_logger.payload as *mut Logger) });
         }
@@ -425,7 +424,7 @@ impl Parser {
             };
         }
 
-        unsafe { ffi::ts_parser_set_logger(self.0.as_ptr(), c_logger) };
+        unsafe { ffi::ts_parser_set_logger(self.0, c_logger) };
     }
 
     /// Set the destination to which the parser should write debugging graphs
@@ -436,13 +435,13 @@ impl Parser {
     #[doc(alias = "ts_parser_print_dot_graphs")]
     pub fn print_dot_graphs(&mut self, file: &impl AsRawFd) {
         let fd = file.as_raw_fd();
-        unsafe { ffi::ts_parser_print_dot_graphs(self.0.as_ptr(), ffi::dup(fd)) }
+        unsafe { ffi::ts_parser_print_dot_graphs(self.0, ffi::dup(fd)) }
     }
 
     /// Stop the parser from printing debugging graphs while parsing.
     #[doc(alias = "ts_parser_print_dot_graphs")]
     pub fn stop_printing_dot_graphs(&mut self) {
-        unsafe { ffi::ts_parser_print_dot_graphs(self.0.as_ptr(), -1) }
+        unsafe { ffi::ts_parser_print_dot_graphs(self.0, -1) }
     }
 
     /// Parse a slice of UTF8 text.
@@ -459,7 +458,7 @@ impl Parser {
     ///  * The timeout set with [Parser::set_timeout_micros] expired
     ///  * The cancellation flag set with [Parser::set_cancellation_flag] was flipped
     #[doc(alias = "ts_parser_parse")]
-    pub fn parse(&mut self, text: impl AsRef<[u8]>, old_tree: Option<&Tree>) -> Option<Tree> {
+    pub fn parse(&mut self, text: impl AsRef<[u8]>, old_tree: Option<&Tree>) -> Tree {
         let bytes = text.as_ref();
         let len = bytes.len();
         self.parse_with(
@@ -476,11 +475,7 @@ impl Parser {
     ///   If the text of the document has changed since `old_tree` was
     ///   created, then you must edit `old_tree` to match the new text using
     ///   [Tree::edit].
-    pub fn parse_utf16(
-        &mut self,
-        input: impl AsRef<[u16]>,
-        old_tree: Option<&Tree>,
-    ) -> Option<Tree> {
+    pub fn parse_utf16(&mut self, input: impl AsRef<[u16]>, old_tree: Option<&Tree>) -> Tree {
         let code_points = input.as_ref();
         let len = code_points.len();
         self.parse_utf16_with(
@@ -504,7 +499,7 @@ impl Parser {
         &mut self,
         callback: &mut F,
         old_tree: Option<&Tree>,
-    ) -> Option<Tree> {
+    ) -> Tree {
         // A pointer to this payload is passed on every call to the `read` C function.
         // The payload contains two things:
         // 1. A reference to the rust `callback`.
@@ -532,10 +527,10 @@ impl Parser {
             encoding: ffi::TSInputEncoding_TSInputEncodingUTF8,
         };
 
-        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0.as_ptr());
+        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0);
         unsafe {
-            let c_new_tree = ffi::ts_parser_parse(self.0.as_ptr(), c_old_tree, c_input);
-            NonNull::new(c_new_tree).map(Tree)
+            let c_new_tree = ffi::ts_parser_parse(self.0, c_old_tree, c_input);
+            Tree(c_new_tree, PhantomData)
         }
     }
 
@@ -554,7 +549,7 @@ impl Parser {
         &mut self,
         callback: &mut F,
         old_tree: Option<&Tree>,
-    ) -> Option<Tree> {
+    ) -> Tree {
         // A pointer to this payload is passed on every call to the `read` C function.
         // The payload contains two things:
         // 1. A reference to the rust `callback`.
@@ -588,10 +583,10 @@ impl Parser {
             encoding: ffi::TSInputEncoding_TSInputEncodingUTF16,
         };
 
-        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0.as_ptr());
+        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0);
         unsafe {
-            let c_new_tree = ffi::ts_parser_parse(self.0.as_ptr(), c_old_tree, c_input);
-            NonNull::new(c_new_tree).map(Tree)
+            let c_new_tree = ffi::ts_parser_parse(self.0, c_old_tree, c_input);
+            Tree(c_new_tree, PhantomData)
         }
     }
 
@@ -603,7 +598,7 @@ impl Parser {
     /// use this parser to parse some other document, you must call `reset` first.
     #[doc(alias = "ts_parser_reset")]
     pub fn reset(&mut self) {
-        unsafe { ffi::ts_parser_reset(self.0.as_ptr()) }
+        unsafe { ffi::ts_parser_reset(self.0) }
     }
 
     /// Get the duration in microseconds that parsing is allowed to take.
@@ -611,7 +606,7 @@ impl Parser {
     /// This is set via [set_timeout_micros](Parser::set_timeout_micros).
     #[doc(alias = "ts_parser_timeout_micros")]
     pub fn timeout_micros(&self) -> u64 {
-        unsafe { ffi::ts_parser_timeout_micros(self.0.as_ptr()) }
+        unsafe { ffi::ts_parser_timeout_micros(self.0) }
     }
 
     /// Set the maximum duration in microseconds that parsing should be allowed to
@@ -621,7 +616,7 @@ impl Parser {
     /// See `parse` for more information.
     #[doc(alias = "ts_parser_set_timeout_micros")]
     pub fn set_timeout_micros(&mut self, timeout_micros: u64) {
-        unsafe { ffi::ts_parser_set_timeout_micros(self.0.as_ptr(), timeout_micros) }
+        unsafe { ffi::ts_parser_set_timeout_micros(self.0, timeout_micros) }
     }
 
     /// Set the ranges of text that the parser should include when parsing.
@@ -645,11 +640,7 @@ impl Parser {
         let ts_ranges: Vec<ffi::TSRange> =
             ranges.iter().cloned().map(|range| range.into()).collect();
         let result = unsafe {
-            ffi::ts_parser_set_included_ranges(
-                self.0.as_ptr(),
-                ts_ranges.as_ptr(),
-                ts_ranges.len() as u32,
-            )
+            ffi::ts_parser_set_included_ranges(self.0, ts_ranges.as_ptr(), ts_ranges.len() as u32)
         };
 
         if result {
@@ -669,7 +660,7 @@ impl Parser {
     /// Get the parser's current cancellation flag pointer.
     #[doc(alias = "ts_parser_cancellation_flag")]
     pub unsafe fn cancellation_flag(&self) -> Option<&AtomicUsize> {
-        (ffi::ts_parser_cancellation_flag(self.0.as_ptr()) as *const AtomicUsize).as_ref()
+        (ffi::ts_parser_cancellation_flag(self.0) as *const AtomicUsize).as_ref()
     }
 
     /// Set the parser's current cancellation flag pointer.
@@ -681,34 +672,34 @@ impl Parser {
     pub unsafe fn set_cancellation_flag(&mut self, flag: Option<&AtomicUsize>) {
         if let Some(flag) = flag {
             ffi::ts_parser_set_cancellation_flag(
-                self.0.as_ptr(),
+                self.0,
                 flag as *const AtomicUsize as *const usize,
             );
         } else {
-            ffi::ts_parser_set_cancellation_flag(self.0.as_ptr(), ptr::null());
+            ffi::ts_parser_set_cancellation_flag(self.0, ptr::null());
         }
     }
 }
 
-impl Default for Parser {
+impl<'a> Default for Parser<'a> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for Parser {
+impl<'a> Drop for Parser<'a> {
     fn drop(&mut self) {
         self.stop_printing_dot_graphs();
         self.set_logger(None);
-        unsafe { ffi::ts_parser_delete(self.0.as_ptr()) }
+        unsafe { ffi::ts_parser_delete(self.0) }
     }
 }
 
-impl Tree {
+impl<'a> Tree<'a> {
     /// Get the root node of the syntax tree.
     #[doc(alias = "ts_tree_root_node")]
     pub fn root_node(&self) -> Node {
-        Node::new(unsafe { ffi::ts_tree_root_node(self.0.as_ptr()) }).unwrap()
+        Node::new(unsafe { ffi::ts_tree_root_node(self.0) }).unwrap()
     }
 
     /// Get the root node of the syntax tree, but with its position shifted
@@ -716,11 +707,7 @@ impl Tree {
     #[doc(alias = "ts_tree_root_node_with_offset")]
     pub fn root_node_with_offset(&self, offset_bytes: usize, offset_extent: Point) -> Node {
         Node::new(unsafe {
-            ffi::ts_tree_root_node_with_offset(
-                self.0.as_ptr(),
-                offset_bytes as u32,
-                offset_extent.into(),
-            )
+            ffi::ts_tree_root_node_with_offset(self.0, offset_bytes as u32, offset_extent.into())
         })
         .unwrap()
     }
@@ -728,7 +715,7 @@ impl Tree {
     /// Get the language that was used to parse the syntax tree.
     #[doc(alias = "ts_tree_language")]
     pub fn language(&self) -> Language {
-        Language(unsafe { ffi::ts_tree_language(self.0.as_ptr()) })
+        Language(unsafe { ffi::ts_tree_language(self.0) })
     }
 
     /// Edit the syntax tree to keep it in sync with source code that has been
@@ -739,7 +726,7 @@ impl Tree {
     #[doc(alias = "ts_tree_edit")]
     pub fn edit(&mut self, edit: &InputEdit) {
         let edit = edit.into();
-        unsafe { ffi::ts_tree_edit(self.0.as_ptr(), &edit) };
+        unsafe { ffi::ts_tree_edit(self.0, &edit) };
     }
 
     /// Create a new [TreeCursor] starting from the root of the tree.
@@ -758,11 +745,7 @@ impl Tree {
     pub fn changed_ranges(&self, other: &Tree) -> impl ExactSizeIterator<Item = Range> {
         let mut count = 0u32;
         unsafe {
-            let ptr = ffi::ts_tree_get_changed_ranges(
-                self.0.as_ptr(),
-                other.0.as_ptr(),
-                &mut count as *mut u32,
-            );
+            let ptr = ffi::ts_tree_get_changed_ranges(self.0, other.0, &mut count as *mut u32);
             util::CBufferIter::new(ptr, count as usize).map(|r| r.into())
         }
     }
@@ -771,7 +754,7 @@ impl Tree {
     pub fn included_ranges(&self) -> Vec<Range> {
         let mut count = 0u32;
         unsafe {
-            let ptr = ffi::ts_tree_included_ranges(self.0.as_ptr(), &mut count as *mut u32);
+            let ptr = ffi::ts_tree_included_ranges(self.0, &mut count as *mut u32);
             let ranges = slice::from_raw_parts(ptr, count as usize);
             let result = ranges.iter().copied().map(|range| range.into()).collect();
             (FREE_FN)(ptr as *mut c_void);
@@ -786,25 +769,25 @@ impl Tree {
     #[doc(alias = "ts_tree_print_dot_graph")]
     pub fn print_dot_graph(&self, file: &impl AsRawFd) {
         let fd = file.as_raw_fd();
-        unsafe { ffi::ts_tree_print_dot_graph(self.0.as_ptr(), fd) }
+        unsafe { ffi::ts_tree_print_dot_graph(self.0, fd) }
     }
 }
 
-impl fmt::Debug for Tree {
+impl<'a> fmt::Debug for Tree<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "{{Tree {:?}}}", self.root_node())
     }
 }
 
-impl Drop for Tree {
+impl<'a> Drop for Tree<'a> {
     fn drop(&mut self) {
-        unsafe { ffi::ts_tree_delete(self.0.as_ptr()) }
+        unsafe { ffi::ts_tree_delete(self.0) }
     }
 }
 
-impl Clone for Tree {
-    fn clone(&self) -> Tree {
-        unsafe { Tree(NonNull::new_unchecked(ffi::ts_tree_copy(self.0.as_ptr()))) }
+impl<'a> Clone for Tree<'a> {
+    fn clone(&self) -> Self {
+        unsafe { Tree(ffi::ts_tree_copy(self.0), PhantomData) }
     }
 }
 
@@ -1446,7 +1429,7 @@ impl Query {
         let capture_count = unsafe { ffi::ts_query_capture_count(ptr) };
         let pattern_count = unsafe { ffi::ts_query_pattern_count(ptr) as usize };
         let mut result = Query {
-            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            ptr,
             capture_names: Vec::with_capacity(capture_count as usize),
             capture_quantifiers: Vec::with_capacity(pattern_count),
             text_predicates: Vec::with_capacity(pattern_count),
@@ -1661,15 +1644,13 @@ impl Query {
                 self.text_predicates.len(),
             );
         }
-        unsafe {
-            ffi::ts_query_start_byte_for_pattern(self.ptr.as_ptr(), pattern_index as u32) as usize
-        }
+        unsafe { ffi::ts_query_start_byte_for_pattern(self.ptr, pattern_index as u32) as usize }
     }
 
     /// Get the number of patterns in the query.
     #[doc(alias = "ts_query_pattern_count")]
     pub fn pattern_count(&self) -> usize {
-        unsafe { ffi::ts_query_pattern_count(self.ptr.as_ptr()) as usize }
+        unsafe { ffi::ts_query_pattern_count(self.ptr) as usize }
     }
 
     /// Get the names of the captures used in the query.
@@ -1723,8 +1704,8 @@ impl Query {
     pub fn disable_capture(&mut self, name: &str) {
         unsafe {
             ffi::ts_query_disable_capture(
-                self.ptr.as_ptr(),
-                name.as_bytes().as_ptr() as *const c_char,
+                self.ptr,
+                name.as_bytes() as *const c_char,
                 name.len() as u32,
             );
         }
@@ -1736,19 +1717,19 @@ impl Query {
     /// associated with the pattern.
     #[doc(alias = "ts_query_disable_pattern")]
     pub fn disable_pattern(&mut self, index: usize) {
-        unsafe { ffi::ts_query_disable_pattern(self.ptr.as_ptr(), index as u32) }
+        unsafe { ffi::ts_query_disable_pattern(self.ptr, index as u32) }
     }
 
     /// Check if a given pattern within a query has a single root node.
     #[doc(alias = "ts_query_is_pattern_rooted")]
     pub fn is_pattern_rooted(&self, index: usize) -> bool {
-        unsafe { ffi::ts_query_is_pattern_rooted(self.ptr.as_ptr(), index as u32) }
+        unsafe { ffi::ts_query_is_pattern_rooted(self.ptr, index as u32) }
     }
 
     /// Check if a given pattern within a query has a single root node.
     #[doc(alias = "ts_query_is_pattern_non_local")]
     pub fn is_pattern_non_local(&self, index: usize) -> bool {
-        unsafe { ffi::ts_query_is_pattern_non_local(self.ptr.as_ptr(), index as u32) }
+        unsafe { ffi::ts_query_is_pattern_non_local(self.ptr, index as u32) }
     }
 
     /// Check if a given step in a query is 'definite'.
@@ -1757,9 +1738,7 @@ impl Query {
     /// successfully once it reaches the step.
     #[doc(alias = "ts_query_is_pattern_guaranteed_at_step")]
     pub fn is_pattern_guaranteed_at_step(&self, byte_offset: usize) -> bool {
-        unsafe {
-            ffi::ts_query_is_pattern_guaranteed_at_step(self.ptr.as_ptr(), byte_offset as u32)
-        }
+        unsafe { ffi::ts_query_is_pattern_guaranteed_at_step(self.ptr, byte_offset as u32) }
     }
 
     fn parse_property(
@@ -1832,14 +1811,14 @@ impl QueryCursor {
     #[doc(alias = "ts_query_cursor_new")]
     pub fn new() -> Self {
         QueryCursor {
-            ptr: unsafe { NonNull::new_unchecked(ffi::ts_query_cursor_new()) },
+            ptr: unsafe { ffi::ts_query_cursor_new() },
         }
     }
 
     /// Return the maximum number of in-progress matches for this cursor.
     #[doc(alias = "ts_query_cursor_match_limit")]
     pub fn match_limit(&self) -> u32 {
-        unsafe { ffi::ts_query_cursor_match_limit(self.ptr.as_ptr()) }
+        unsafe { ffi::ts_query_cursor_match_limit(self.ptr) }
     }
 
     /// Set the maximum number of in-progress matches for this cursor.  The limit must be > 0 and
@@ -1847,7 +1826,7 @@ impl QueryCursor {
     #[doc(alias = "ts_query_cursor_set_match_limit")]
     pub fn set_match_limit(&mut self, limit: u32) {
         unsafe {
-            ffi::ts_query_cursor_set_match_limit(self.ptr.as_ptr(), limit);
+            ffi::ts_query_cursor_set_match_limit(self.ptr, limit);
         }
     }
 
@@ -1855,7 +1834,7 @@ impl QueryCursor {
     /// in-progress matches.
     #[doc(alias = "ts_query_cursor_did_exceed_match_limit")]
     pub fn did_exceed_match_limit(&self) -> bool {
-        unsafe { ffi::ts_query_cursor_did_exceed_match_limit(self.ptr.as_ptr()) }
+        unsafe { ffi::ts_query_cursor_did_exceed_match_limit(self.ptr) }
     }
 
     /// Iterate over all of the matches in the order that they were found.
@@ -1870,8 +1849,8 @@ impl QueryCursor {
         node: Node<'tree>,
         text_provider: T,
     ) -> QueryMatches<'a, 'tree, T> {
-        let ptr = self.ptr.as_ptr();
-        unsafe { ffi::ts_query_cursor_exec(ptr, query.ptr.as_ptr(), node.0) };
+        let ptr = self.ptr;
+        unsafe { ffi::ts_query_cursor_exec(ptr, query.ptr, node.0) };
         QueryMatches {
             ptr,
             query,
@@ -1893,8 +1872,8 @@ impl QueryCursor {
         node: Node<'tree>,
         text_provider: T,
     ) -> QueryCaptures<'a, 'tree, T> {
-        let ptr = self.ptr.as_ptr();
-        unsafe { ffi::ts_query_cursor_exec(self.ptr.as_ptr(), query.ptr.as_ptr(), node.0) };
+        let ptr = self.ptr;
+        unsafe { ffi::ts_query_cursor_exec(self.ptr, query.ptr, node.0) };
         QueryCaptures {
             ptr,
             query,
@@ -1909,11 +1888,7 @@ impl QueryCursor {
     #[doc(alias = "ts_query_cursor_set_byte_range")]
     pub fn set_byte_range(&mut self, range: ops::Range<usize>) -> &mut Self {
         unsafe {
-            ffi::ts_query_cursor_set_byte_range(
-                self.ptr.as_ptr(),
-                range.start as u32,
-                range.end as u32,
-            );
+            ffi::ts_query_cursor_set_byte_range(self.ptr, range.start as u32, range.end as u32);
         }
         self
     }
@@ -1922,11 +1897,7 @@ impl QueryCursor {
     #[doc(alias = "ts_query_cursor_set_point_range")]
     pub fn set_point_range(&mut self, range: ops::Range<Point>) -> &mut Self {
         unsafe {
-            ffi::ts_query_cursor_set_point_range(
-                self.ptr.as_ptr(),
-                range.start.into(),
-                range.end.into(),
-            );
+            ffi::ts_query_cursor_set_point_range(self.ptr, range.start.into(), range.end.into());
         }
         self
     }
@@ -1934,7 +1905,7 @@ impl QueryCursor {
     #[doc(alias = "ts_query_cursor_set_max_start_depth")]
     pub fn set_max_start_depth(&mut self, max_start_depth: u32) -> &mut Self {
         unsafe {
-            ffi::ts_query_cursor_set_max_start_depth(self.ptr.as_ptr(), max_start_depth);
+            ffi::ts_query_cursor_set_max_start_depth(self.ptr, max_start_depth);
         }
         self
     }
@@ -2188,13 +2159,13 @@ impl PartialEq for Query {
 
 impl Drop for Query {
     fn drop(&mut self) {
-        unsafe { ffi::ts_query_delete(self.ptr.as_ptr()) }
+        unsafe { ffi::ts_query_delete(self.ptr) }
     }
 }
 
 impl Drop for QueryCursor {
     fn drop(&mut self) {
-        unsafe { ffi::ts_query_cursor_delete(self.ptr.as_ptr()) }
+        unsafe { ffi::ts_query_cursor_delete(self.ptr) }
     }
 }
 
@@ -2383,12 +2354,12 @@ impl error::Error for LanguageError {}
 impl error::Error for QueryError {}
 
 unsafe impl Send for Language {}
-unsafe impl Send for Parser {}
+unsafe impl<'a> Send for Parser<'a> {}
 unsafe impl Send for Query {}
 unsafe impl Send for QueryCursor {}
-unsafe impl Send for Tree {}
+unsafe impl<'a> Send for Tree<'a> {}
 unsafe impl Sync for Language {}
-unsafe impl Sync for Parser {}
+unsafe impl<'a> Sync for Parser<'a> {}
 unsafe impl Sync for Query {}
 unsafe impl Sync for QueryCursor {}
-unsafe impl Sync for Tree {}
+unsafe impl<'a> Sync for Tree<'a> {}
